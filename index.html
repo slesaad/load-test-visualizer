@@ -802,7 +802,7 @@ async function fetchYaml(path) {
     const r = await fetch(path);
     if (!r.ok) throw new Error('not ok');
     const text = await r.text();
-    return jsyaml.load(text);
+    return { text, doc: jsyaml.load(text) };
   } catch (e) { return null; }
 }
 
@@ -815,7 +815,7 @@ function updateYamlIndicator(panel) {
       (panel.yamlSource === 'manual' ? ` <span class="clear-yaml" title="Use auto-detected phases instead">✕</span>` : '');
     const clearBtn = el.querySelector('.clear-yaml');
     if (clearBtn) clearBtn.onclick = () => {
-      panel.yaml = null; panel.yamlPath = null; panel.yamlSource = null;
+      panel.yaml = null; panel.yamlText = null; panel.yamlPath = null; panel.yamlSource = null;
       // Re-fetch from source URL to give the sibling-YAML auto-probe another chance; otherwise just re-render.
       if (panel.sourceUrl) loadFromUrl(panel.sourceUrl, panel);
       else if (panel.lastData) renderSafe(panel.lastData, panel);
@@ -835,7 +835,7 @@ function switchToReport(name, panel) {
   panel.sourceUrl = entry.sourceUrl || null;
   // Reset auto-attached YAML; manual stays sticky.
   if (panel.yamlSource !== 'manual') {
-    panel.yaml = null; panel.yamlPath = null; panel.yamlSource = null;
+    panel.yaml = null; panel.yamlText = null; panel.yamlPath = null; panel.yamlSource = null;
   }
   renderSafe(entry.data, panel);
   syncShareButton();
@@ -866,11 +866,11 @@ async function loadFromUrl(url, panel) {
     if (panel.yamlSource !== 'manual') {
       const yamlPath = await probeYaml(url);
       if (yamlPath) {
-        const doc = await fetchYaml(yamlPath);
-        if (doc) { panel.yaml = doc; panel.yamlPath = yamlPath; panel.yamlSource = 'auto'; }
-        else { panel.yaml = null; panel.yamlPath = null; panel.yamlSource = null; }
+        const result = await fetchYaml(yamlPath);
+        if (result) { panel.yaml = result.doc; panel.yamlText = result.text; panel.yamlPath = yamlPath; panel.yamlSource = 'auto'; }
+        else { panel.yaml = null; panel.yamlText = null; panel.yamlPath = null; panel.yamlSource = null; }
       } else {
-        panel.yaml = null; panel.yamlPath = null; panel.yamlSource = null;
+        panel.yaml = null; panel.yamlText = null; panel.yamlPath = null; panel.yamlSource = null;
       }
     }
     panel.currentReport = niceName;
@@ -977,8 +977,9 @@ function ingestFile(file, target) {
   reader.onload = (ev) => {
     if (isYaml) {
       try {
-        const doc = jsyaml.load(ev.target.result);
-        target.yaml = doc;
+        const text = ev.target.result;
+        target.yaml = jsyaml.load(text);
+        target.yamlText = text;
         target.yamlPath = file.name;
         target.yamlSource = 'manual';
         if (target.lastData) renderSafe(target.lastData, target);
@@ -1010,14 +1011,16 @@ async function init() {
   // Parse URL — load from ?url= or #data= if present.
   const params = new URLSearchParams(location.search);
   const urlParam = params.get('url');
-  const hash = location.hash || '';
-  const dataMatch = hash.match(/^#data=([A-Za-z0-9_\-]+)$/);
+  const yamlUrlParam = params.get('yaml');
+  const hashParams = new URLSearchParams((location.hash || '').replace(/^#/, ''));
+  const data64 = hashParams.get('data');
+  const cfg64 = hashParams.get('cfg');
 
   if (urlParam) {
     await loadFromUrl(urlParam, a);
-  } else if (dataMatch) {
+  } else if (data64) {
     try {
-      const json = await ungzipFromB64Url(dataMatch[1]);
+      const json = await ungzipFromB64Url(data64);
       const data = JSON.parse(json);
       const name = params.get('name') || 'shared-report.json';
       addSessionReport(name, data, null);
@@ -1027,6 +1030,36 @@ async function init() {
       syncShareButton();
     } catch (e) {
       alert('Could not decode shared report: ' + e.message);
+    }
+  }
+
+  // YAML config from share URL (inline cfg= takes precedence over yaml= URL fetch).
+  if (cfg64) {
+    try {
+      const text = await ungzipFromB64Url(cfg64);
+      a.yamlText = text;
+      a.yaml = jsyaml.load(text);
+      a.yamlPath = 'shared.yml';
+      a.yamlSource = 'manual';  // treat as user-attached so it sticks
+      if (a.lastData) renderSafe(a.lastData, a);
+      else updateYamlIndicator(a);
+    } catch (e) {
+      console.warn('Could not decode shared YAML config:', e);
+    }
+  } else if (yamlUrlParam) {
+    try {
+      const r = await fetch(yamlUrlParam);
+      if (r.ok) {
+        const text = await r.text();
+        a.yamlText = text;
+        a.yaml = jsyaml.load(text);
+        a.yamlPath = yamlUrlParam;
+        a.yamlSource = 'manual';
+        if (a.lastData) renderSafe(a.lastData, a);
+        else updateYamlIndicator(a);
+      }
+    } catch (e) {
+      console.warn('Could not fetch shared YAML config:', e);
     }
   }
 
@@ -1113,33 +1146,54 @@ async function openSharePopover() {
   body.innerHTML = `<div class="share-note">Generating link…</div>`;
   pop.style.display = 'block';
 
-  let shareUrl, note, warn = false;
+  // Get YAML text for inclusion. If the panel has a parsed yaml but no
+  // captured raw text (legacy), re-serialize via jsyaml.dump.
+  let yamlText = panel.yamlText || null;
+  if (!yamlText && panel.yaml) {
+    try { yamlText = jsyaml.dump(panel.yaml); } catch (e) { yamlText = null; }
+  }
+
+  let shareUrl, jsonNote, warn = false;
+  const u = new URL(location.href.split('?')[0].split('#')[0]);
+  const hashParts = [];
+
   if (panel.sourceUrl) {
-    // Round-trip the original URL — recipients fetch from the same source.
-    const u = new URL(location.href.split('?')[0].split('#')[0]);
     u.searchParams.set('url', panel.sourceUrl);
-    shareUrl = u.toString();
-    note = `Recipients will fetch the report from <code>${escapeHtml(panel.sourceUrl)}</code> directly. Make sure that URL is publicly accessible and CORS-enabled (e.g. a gist <em>raw</em> URL, S3 with CORS, Pages, etc.).`;
+    jsonNote = `Report fetched from <code>${escapeHtml(panel.sourceUrl)}</code>.`;
   } else {
-    // Encode the data inline via gzip+base64 in the fragment.
     try {
       const json = JSON.stringify(panel.lastData);
       const b64 = await gzipB64Url(json);
-      const u = new URL(location.href.split('?')[0].split('#')[0]);
       if (panel.currentReport) u.searchParams.set('name', panel.currentReport);
-      u.hash = 'data=' + b64;
-      shareUrl = u.toString();
-      const kb = (shareUrl.length / 1024).toFixed(1);
-      if (shareUrl.length > 32000) {
-        warn = true;
-        note = `Link is <strong>${kb} KB</strong> — too long for some browsers/services. For large reports, upload the JSON to a gist (raw URL) or S3 and share <code>?url=…</code> instead.`;
-      } else {
-        note = `Link is <strong>${kb} KB</strong>, contains the full report inline (gzip-compressed). No server needed.`;
-      }
+      hashParts.push('data=' + b64);
+      jsonNote = `Report embedded inline (gzip-compressed).`;
     } catch (e) {
       body.innerHTML = `<div class="share-note">Could not encode: ${escapeHtml(e.message)}. Try hosting the JSON externally (gist raw, S3, etc.) and load via <code>?url=…</code>.</div>`;
       return;
     }
+  }
+
+  let cfgNote = '';
+  if (yamlText) {
+    try {
+      const cfgB64 = await gzipB64Url(yamlText);
+      hashParts.push('cfg=' + cfgB64);
+      cfgNote = ` Test config included (${(yamlText.length / 1024).toFixed(1)} KB raw).`;
+    } catch (e) {
+      cfgNote = ` (could not encode test config: ${escapeHtml(e.message)})`;
+    }
+  }
+
+  if (hashParts.length) u.hash = hashParts.join('&');
+  shareUrl = u.toString();
+  const kb = (shareUrl.length / 1024).toFixed(1);
+  let note = `Link is <strong>${kb} KB</strong>. ${jsonNote}${cfgNote}`;
+  if (panel.sourceUrl && !yamlText) {
+    note += ` Make sure the URL is publicly accessible + CORS-enabled (gist <em>raw</em>, S3 with CORS, Pages, etc.).`;
+  }
+  if (shareUrl.length > 32000) {
+    warn = true;
+    note += ` <strong style="color:var(--fail-fg)">Too long for some browsers/services</strong> — host the JSON externally and share <code>?url=…</code> instead.`;
   }
 
   pop.classList.toggle('warn', warn);
