@@ -244,10 +244,12 @@
   .legend .swatch.dotted { background-image: radial-gradient(circle, currentColor 40%, transparent 45%); background-size: 4px 3px; background-repeat: repeat-x; background-position: center; background-color: transparent !important; box-shadow: none; }
   /* Phase timeline — colored segments above the chart aligned to phase duration */
   .phase-timeline {
-    display: flex; width: 100%; gap: 3px;
-    margin-bottom: 8px; min-height: 22px;
+    display: flex; width: 100%; gap: 2px;
+    margin-bottom: 4px; min-height: 22px;
     font-family: var(--font-mono); font-size: 10px;
     letter-spacing: 0.08em; text-transform: uppercase;
+    box-sizing: border-box;
+    /* padding-left/padding-right are set dynamically to match chart.chartArea */
   }
   .phase-seg {
     position: relative;
@@ -571,6 +573,8 @@
   .yaml-indicator .inferred { color: var(--muted-2); }
   .yaml-indicator.on { color: var(--text); background: rgba(0,158,115,0.07); border-color: rgba(0,158,115,0.30); }
   .yaml-indicator.on .ok { color: var(--ok-green); text-shadow: 0 0 8px var(--ok-green); }
+  .yaml-indicator.on.mismatch { background: rgba(213,94,0,0.10); border-color: rgba(213,94,0,0.40); color: var(--text); }
+  .yaml-indicator.on.mismatch .warn { color: var(--fail-fg); text-shadow: 0 0 8px rgba(255,138,61,0.5); }
   .yaml-indicator .clear-yaml {
     cursor: pointer; color: var(--muted); margin-left: 4px;
     padding: 0 4px; border-radius: 4px;
@@ -793,6 +797,47 @@
 const panels = []; // [{ root, select, closeBtn, charts, tag }]
 const sessionReports = new Map(); // name -> { data, sourceUrl?: string }
 
+// Color tokens for phases — match the phase-pill CSS but at lower alpha for chart bg.
+function phaseBgColor(kind) {
+  if (kind === 'up')   return 'rgba(0,158,115,0.10)';
+  if (kind === 'down') return 'rgba(204,121,167,0.10)';
+  return 'rgba(86,180,233,0.08)';
+}
+
+// Chart.js plugin: paint each phase as a colored band in the chart background,
+// and (afterRender) match the timeline strip's left/right padding to chart.chartArea.
+const phaseBgPlugin = {
+  id: 'phaseBg',
+  beforeDatasetsDraw(chart) {
+    const opts = chart.options.plugins?.phaseBg || {};
+    const phases = opts.phases || [];
+    if (!phases.length) return;
+    const { ctx, chartArea } = chart;
+    const totalW = chartArea.right - chartArea.left;
+    let cursor = chartArea.left;
+    for (const p of phases) {
+      const w = totalW * (p.fraction || 0);
+      if (w <= 0) continue;
+      ctx.save();
+      ctx.fillStyle = phaseBgColor(p.kind);
+      ctx.fillRect(cursor, chartArea.top, w, chartArea.bottom - chartArea.top);
+      ctx.restore();
+      cursor += w;
+    }
+  },
+  afterRender(chart) {
+    const opts = chart.options.plugins?.phaseBg || {};
+    const timelineEl = opts.timelineEl;
+    if (!timelineEl) return;
+    const canvas = chart.canvas;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width) return;
+    timelineEl.style.paddingLeft = chart.chartArea.left + 'px';
+    timelineEl.style.paddingRight = (rect.width - chart.chartArea.right) + 'px';
+  }
+};
+Chart.register(phaseBgPlugin);
+
 function fmtTime(ts) {
   const d = new Date(ts);
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
@@ -854,9 +899,16 @@ function updateYamlIndicator(panel) {
   const el = panel.root.querySelector('.js-yaml-indicator');
   if (!el) return;
   if (panel.yaml && panel.yamlPath) {
-    el.className = 'yaml-indicator js-yaml-indicator on';
-    el.innerHTML = `<span class="ok">●</span> config: <code>${panel.yamlPath.split('/').pop()}</code>` +
-      (panel.yamlSource === 'manual' ? ` <span class="clear-yaml" title="Use auto-detected phases instead">✕</span>` : '');
+    const mm = panel.yamlMismatch;
+    el.className = 'yaml-indicator js-yaml-indicator on' + (mm ? ' mismatch' : '');
+    const baseName = panel.yamlPath.split('/').pop();
+    const clearTag = panel.yamlSource === 'manual' ? ` <span class="clear-yaml" title="Detach this config">✕</span>` : '';
+    if (mm) {
+      el.innerHTML = `<span class="warn">⚠</span> config: <code>${baseName}</code> ` +
+        `<span class="info-i" tabindex="0" aria-label="phase-duration mismatch" data-tip="Phases hidden — YAML total duration (${mm.yamlSec}s) doesn't match the report (${mm.reportSec}s). Make sure this is the right config for this report.">i</span>${clearTag}`;
+    } else {
+      el.innerHTML = `<span class="ok">●</span> config: <code>${baseName}</code>${clearTag}`;
+    }
     const clearBtn = el.querySelector('.clear-yaml');
     if (clearBtn) clearBtn.onclick = () => {
       panel.yaml = null; panel.yamlText = null; panel.yamlPath = null; panel.yamlSource = null;
@@ -935,6 +987,7 @@ function renderSafe(data, panel) {
     panel.root.__yaml = panel.yaml || null;
     panel.root.__charts = render(data, panel.root);
     panel.root.classList.add('has-data');
+    panel.yamlMismatch = panel.root.__phaseMismatch || null;
     updateYamlIndicator(panel);
     if (document.getElementById('layout').classList.contains('compare')) renderComparison();
   } catch (e) {
@@ -1471,6 +1524,20 @@ function render(data, root) {
   q('.js-avg-rps').textContent = avgRps;
   q('.js-peak-rps').textContent = peakRps;
 
+  // ---------- Phases (computed up-front so the trend chart can paint them as backgrounds)
+  const yamlCfg = root.__yaml;
+  const yamlPhasesAll = yamlPhasesFor(yamlCfg);
+  const yamlTotalSec = yamlPhasesAll.reduce((s, p) => s + (p.durationSec || 0), 0);
+  const reportSec = Math.max(0, Math.round(((endTs || 0) - (startTs || 0)) / 1000));
+  const PHASE_TOLERANCE = 0.10;  // 10% — covers natural startup/teardown overhead
+  const phaseMismatch = yamlPhasesAll.length > 0 && yamlTotalSec > 0 && reportSec > 0 &&
+    Math.abs(yamlTotalSec - reportSec) / reportSec > PHASE_TOLERANCE;
+  const phases = phaseMismatch ? [] : yamlPhasesAll;
+  // Stash mismatch info on root so the indicator updater can read it.
+  root.__phaseMismatch = phaseMismatch ? { yamlSec: yamlTotalSec, reportSec } : null;
+  const phaseTimelineEl = q('.js-phase-timeline');
+  renderPhaseTimeline(phaseTimelineEl, phases);
+
   // ---------- Trend chart
   const labels = intermediate.map(i => fmtTime(i.firstCounterAt));
   const reqRate = intermediate.map(i => i.rates?.['http.request_rate'] || 0);
@@ -1512,6 +1579,7 @@ function render(data, root) {
       maintainAspectRatio: false,
       plugins: {
         legend: { display: false },
+        phaseBg: { phases, timelineEl: phaseTimelineEl },
         tooltip: {
           mode: 'index', intersect: false,
           backgroundColor: 'rgba(11,15,21,0.95)',
@@ -1660,11 +1728,6 @@ function render(data, root) {
   }
   loadMoreBtn.onclick = () => { showAll = !showAll; renderUrls(); };
   renderUrls();
-
-  // ---------- Phases: from attached YAML config only.
-  const yamlCfg = root.__yaml;
-  const phases = yamlPhasesFor(yamlCfg);
-  renderPhaseTimeline(q('.js-phase-timeline'), phases);
 
   // ---------- Test config — sidebar driven by panel A; shows YAML config if available.
   const sideConfig = document.querySelector('.side .js-test-config');
