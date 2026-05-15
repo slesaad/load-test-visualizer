@@ -599,6 +599,48 @@
     box-shadow: 0 12px 40px -8px rgba(0,114,178,0.6), 0 0 0 1px rgba(255,255,255,0.1) inset;
   }
 
+  /* Compare-table panel (only visible in compare mode) — dense flat table */
+  .compare-table-panel { display: none; padding: 14px 18px; }
+  .layout.compare > .compare-table-panel { display: block; grid-column: 1 / -1; }
+  .compare-table-panel h3 { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+  .compare-table-panel .ct-search {
+    margin-left: auto;
+    background: var(--code-bg); border: 1px solid var(--border);
+    color: var(--text); padding: 4px 10px; border-radius: 6px;
+    font: inherit; font-size: 11.5px; min-width: 220px;
+  }
+  .compare-table-panel .ct-search:focus { outline: none; border-color: var(--ok-sky); box-shadow: 0 0 0 3px rgba(86,180,233,0.18); }
+  .compare-table-panel table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .compare-table-panel thead th {
+    text-align: left; padding: 6px 10px;
+    color: var(--muted); font-family: var(--font-mono); font-size: 9.5px;
+    border-bottom: 1px solid var(--border-strong);
+    letter-spacing: 0.16em; text-transform: uppercase; font-weight: 600;
+    position: sticky; top: 0; background: var(--panel); z-index: 1;
+  }
+  .compare-table-panel tbody td {
+    padding: 3px 10px; border-bottom: 1px solid var(--border);
+    vertical-align: middle; line-height: 1.4;
+  }
+  .compare-table-panel tbody tr:hover td { background: rgba(86,180,233,0.04); }
+  .compare-table-panel td.metric {
+    color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;
+    word-break: break-all; min-width: 38%;
+  }
+  .compare-table-panel td.value {
+    color: var(--text-strong); font-variant-numeric: tabular-nums;
+    white-space: nowrap; font-family: var(--font-mono); font-size: 11px;
+  }
+  .compare-table-panel td.value .delta {
+    display: inline-block; margin-left: 6px; font-size: 10px;
+    color: var(--muted-2); font-variant-numeric: tabular-nums;
+  }
+  .compare-table-panel td.value .delta.better { color: var(--ok-green); }
+  .compare-table-panel td.value .delta.worse  { color: var(--fail-fg); }
+  .compare-table-panel td.value.dim { color: var(--muted); }
+  .compare-table-panel .ct-scroll { max-height: 70vh; overflow-y: auto; }
+  .compare-table-panel tr.hide { display: none; }
+
   /* Responsive */
   .layout { grid-template-columns: minmax(0, 1fr) 320px; }
   .main { min-width: 0; }
@@ -662,6 +704,8 @@
     </div>
 
   </div>
+
+  <div class="panel compare-table-panel" id="compare-table"></div>
 </div>
 
 <template id="main-template">
@@ -892,6 +936,7 @@ function renderSafe(data, panel) {
     panel.root.__charts = render(data, panel.root);
     panel.root.classList.add('has-data');
     updateYamlIndicator(panel);
+    if (document.getElementById('layout').classList.contains('compare')) renderComparison();
   } catch (e) {
     alert('Failed to render report: ' + e.message);
     console.error(e);
@@ -959,6 +1004,7 @@ function enterCompare() {
   const aValue = panels[0].select.value;
   const alt = Array.from(sessionReports.keys()).find(n => n !== aValue);
   if (alt) switchToReport(alt, b);
+  renderComparison();
 }
 
 function exitCompare() {
@@ -966,6 +1012,7 @@ function exitCompare() {
   document.getElementById('tab-compare').classList.remove('active');
   const b = panels[1];
   if (b) removePanel(b);
+  document.getElementById('compare-table').innerHTML = '';
 }
 
 function ingestFile(file, target) {
@@ -1003,6 +1050,188 @@ function ingestFile(file, target) {
     }
   };
   reader.readAsText(file);
+}
+
+// ---------- Compare-table rendering ----------
+function summarize(data) {
+  if (!data) return null;
+  const c = data.aggregate?.counters || {};
+  const s = data.aggregate?.summaries || {};
+  const startMs = data.aggregate?.firstCounterAt;
+  const endMs = data.aggregate?.lastCounterAt;
+  const durationSec = startMs && endMs ? Math.max(1, Math.round((endMs - startMs) / 1000)) : 0;
+  const rates = (data.intermediate || []).map(i => i.rates?.['http.request_rate'] || 0);
+  const avgRps = rates.length ? Math.round(rates.reduce((a,b)=>a+b,0)/rates.length) : 0;
+  const peakRps = rates.length ? Math.max(...rates) : 0;
+
+  // HTTP code counts
+  const codes = {};
+  for (const [k, v] of Object.entries(c)) {
+    const m = k.match(/^http\.codes\.(\d+)$/);
+    if (m) codes[m[1]] = v;
+  }
+  // Per-endpoint code counts: key is "<METHOD URL> · <code>"
+  const epCounts = {};
+  for (const [k, v] of Object.entries(c)) {
+    const m = k.match(/^plugins\.metrics-by-endpoint\.(.+)\.codes\.(\d+)$/);
+    if (m) epCounts[`${m[1]} · ${m[2]}`] = v;
+  }
+  // Per-endpoint response_time summaries: each is a {min,mean,p50,...,max}
+  const epLat = {};
+  for (const [k, v] of Object.entries(s)) {
+    const m = k.match(/^plugins\.metrics-by-endpoint\.response_time\.(.+)$/);
+    if (m) epLat[m[1]] = v;
+  }
+
+  return {
+    startMs, endMs, durationSec, avgRps, peakRps,
+    requests: c['http.requests'] || 0,
+    responses: c['http.responses'] || 0,
+    downloadedBytes: c['http.downloaded_bytes'] || 0,
+    vusersCreated: c['vusers.created'] || 0,
+    vusersCompleted: c['vusers.completed'] || 0,
+    vusersFailed: c['vusers.failed'] || 0,
+    latency: s['http.response_time'] || {},
+    sessionLen: s['vusers.session_length'] || {},
+    codes, epCounts, epLat,
+  };
+}
+
+function fmtNum(n) {
+  if (n == null || Number.isNaN(n)) return '—';
+  if (typeof n !== 'number') return String(n);
+  return n.toLocaleString();
+}
+function fmtBytes(n) {
+  if (n == null || !n) return fmtNum(n);
+  const u = ['B','KB','MB','GB'];
+  let i = 0; while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(n >= 100 ? 0 : 1) + ' ' + u[i];
+}
+function fmtDurationSec(sec) {
+  if (!sec) return '—';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return m ? `${m}m ${String(s).padStart(2,'0')}s` : `${s}s`;
+}
+
+function deltaText(a, b, opts) {
+  if (a == null || b == null || typeof a !== 'number' || typeof b !== 'number') return '';
+  if (a === b) return '';
+  const abs = b - a;
+  let cls = '';
+  if (opts && opts.lowerBetter) cls = abs < 0 ? 'better' : 'worse';
+  else if (opts && opts.higherBetter) cls = abs > 0 ? 'better' : 'worse';
+  let txt;
+  if (a !== 0) {
+    const pct = ((b - a) / Math.abs(a)) * 100;
+    const sign = pct >= 0 ? '+' : '';
+    txt = `${sign}${pct.toFixed(pct >= 100 || pct <= -100 ? 0 : 1)}%`;
+  } else {
+    const sign = abs >= 0 ? '+' : '';
+    txt = `${sign}${fmtNum(abs)}`;
+  }
+  return `<span class="delta ${cls}">(${txt})</span>`;
+}
+
+function row(metric, a, b, opts) {
+  const fmt = (opts && opts.fmt) || (typeof a === 'number' || typeof b === 'number' ? fmtNum : (x => x == null ? '—' : String(x)));
+  const dim = (a == null) || (b == null);
+  const delta = (typeof a === 'number' && typeof b === 'number') ? deltaText(a, b, opts) : '';
+  return `<tr class="metric-row">
+    <td class="metric">${escapeHtml(metric)}</td>
+    <td class="value${dim ? ' dim' : ''}">${escapeHtml(fmt(a))}</td>
+    <td class="value${dim ? ' dim' : ''}">${escapeHtml(fmt(b))}${delta}</td>
+  </tr>`;
+}
+function renderComparison() {
+  const el = document.getElementById('compare-table');
+  if (!el) return;
+  const A = panels[0], B = panels[1];
+  if (!A || !B || !A.lastData || !B.lastData) {
+    el.innerHTML = `<h3>Comparison</h3><div style="color:var(--muted);padding:8px 0">Load a report into both panels to see a side-by-side comparison.</div>`;
+    return;
+  }
+  const sA = summarize(A.lastData);
+  const sB = summarize(B.lastData);
+
+  const headLabelA = A.currentReport || 'Base';
+  const headLabelB = B.currentReport || 'Comparison';
+  const latency = sA.latency || {};
+  const latencyB = sB.latency || {};
+
+  const rows = [];
+  // Flat list — no section dividers (matches the reference layout)
+  rows.push(row('source', A.currentReport, B.currentReport));
+  if (A.sourceUrl || B.sourceUrl) rows.push(row('source URL', A.sourceUrl || '—', B.sourceUrl || '—'));
+  rows.push(row('timestamp', new Date(sA.startMs).toLocaleString(), new Date(sB.startMs).toLocaleString()));
+  rows.push(row('duration', sA.durationSec, sB.durationSec, { fmt: fmtDurationSec }));
+
+  // Per-endpoint response_time percentiles (high cardinality but matches the screenshot order)
+  const epLatKeys = Array.from(new Set([...Object.keys(sA.epLat), ...Object.keys(sB.epLat)])).sort();
+  for (const ep of epLatKeys) {
+    for (const k of ['p99','p95','p90','p75','p50','mean','min','max']) {
+      const a = sA.epLat[ep]?.[k];
+      const b = sB.epLat[ep]?.[k];
+      if (a == null && b == null) continue;
+      rows.push(row(`plugins.metrics-by-endpoint.response_time.${ep}.${k}`, a, b, { fmt: fmtMs, lowerBetter: true }));
+    }
+  }
+
+  // Top-level latency
+  for (const k of ['p99','p95','p90','p75','p50','mean','min','max']) {
+    rows.push(row('http.response_time.' + k, latency[k], latencyB[k], { fmt: fmtMs, lowerBetter: true }));
+  }
+  for (const k of ['p99','p95','p90','p75','p50','mean','min','max']) {
+    rows.push(row('vusers.session_length.' + k, sA.sessionLen[k], sB.sessionLen[k], { fmt: fmtMs, lowerBetter: true }));
+  }
+
+  // HTTP code counters (union of both sides)
+  const codeKeys = Array.from(new Set([...Object.keys(sA.codes), ...Object.keys(sB.codes)])).sort();
+  for (const c of codeKeys) {
+    const isErr = !/^2/.test(c);
+    rows.push(row('http.codes.' + c, sA.codes[c] || 0, sB.codes[c] || 0, isErr ? { lowerBetter: true } : null));
+  }
+
+  rows.push(row('http.downloaded_bytes', sA.downloadedBytes, sB.downloadedBytes, { fmt: fmtBytes }));
+  rows.push(row('http.requests', sA.requests, sB.requests));
+  rows.push(row('http.responses', sA.responses, sB.responses));
+  rows.push(row('http.request_rate (avg)', sA.avgRps, sB.avgRps));
+  rows.push(row('http.request_rate (peak)', sA.peakRps, sB.peakRps));
+
+  // Per-endpoint code counts
+  const epCntKeys = Array.from(new Set([...Object.keys(sA.epCounts), ...Object.keys(sB.epCounts)])).sort();
+  for (const k of epCntKeys) {
+    const isErr = / · (?!2\d\d)\d{3}$/.test(k);
+    rows.push(row('plugins.metrics-by-endpoint.' + k, sA.epCounts[k] || 0, sB.epCounts[k] || 0, isErr ? { lowerBetter: true } : null));
+  }
+
+  rows.push(row('vusers.completed', sA.vusersCompleted, sB.vusersCompleted, { higherBetter: true }));
+  rows.push(row('vusers.created',   sA.vusersCreated,   sB.vusersCreated));
+  rows.push(row('vusers.failed',    sA.vusersFailed,    sB.vusersFailed,    { lowerBetter: true }));
+
+  el.innerHTML = `
+    <h3>Comparison
+      <input class="ct-search" type="search" placeholder="Filter metrics…" aria-label="Filter metrics">
+    </h3>
+    <div class="ct-scroll">
+      <table>
+        <thead>
+          <tr><th>Metric</th><th>${escapeHtml(headLabelA)}</th><th>${escapeHtml(headLabelB)}</th></tr>
+        </thead>
+        <tbody>${rows.join('')}</tbody>
+      </table>
+    </div>
+  `;
+
+  // Wire up filter input.
+  const search = el.querySelector('.ct-search');
+  search.addEventListener('input', () => {
+    const q = search.value.trim().toLowerCase();
+    el.querySelectorAll('tr.metric-row').forEach(tr => {
+      const m = tr.querySelector('.metric').textContent.toLowerCase();
+      tr.classList.toggle('hide', q && !m.includes(q));
+    });
+  });
 }
 
 async function init() {
