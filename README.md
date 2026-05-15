@@ -18,6 +18,16 @@ Open `index.html` in a browser. No build, no install.
 
 Files stay in your browser — nothing is uploaded.
 
+## Try it
+
+A sample report (`sample-report.json` + `sample-report.yml`) is included. Once deployed to GitHub Pages, link with:
+
+```
+https://<user>.github.io/<repo>/?url=./sample-report.json
+```
+
+The matching YAML auto-attaches because it's a sibling file, so the phase strip and Test config populate immediately.
+
 ## Deploying
 
 It's a single static file. To host on GitHub Pages:

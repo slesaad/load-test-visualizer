@@ -1,0 +1,6 @@
+config:
+  target: "https://example.com"
+  phases:
+    - name: "Warm up"
+      duration: 60
+      arrivalRate: 1

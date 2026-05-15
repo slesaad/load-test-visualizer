@@ -478,6 +478,12 @@
     font-family: var(--font-mono); font-size: 11.5px; color: var(--text);
   }
   .empty-state .btn { padding: 9px 18px; font-size: 13px; }
+  .empty-state .empty-actions { display: inline-flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+  .empty-state .js-empty-sample {
+    background: rgba(86,180,233,0.10); color: var(--text-strong);
+    border-color: rgba(86,180,233,0.40);
+  }
+  .empty-state .js-empty-sample:hover { background: rgba(86,180,233,0.20); }
   .empty-state .empty-fineprint {
     color: var(--muted-2); font-size: 11px; margin-top: 20px;
     font-family: var(--font-mono); letter-spacing: 0.06em;
@@ -672,7 +678,10 @@
       <div class="empty-icon">⬇</div>
       <h2>Drop your load test report</h2>
       <p class="empty-sub">A <code>.json</code> file produced by your load-test runner — optionally drop its <code>.yml</code> config too.</p>
-      <button class="btn js-empty-open" type="button">Choose a file</button>
+      <div class="empty-actions">
+        <button class="btn js-empty-open" type="button">Choose a file</button>
+        <button class="btn js-empty-sample" type="button">Try a sample</button>
+      </div>
       <p class="empty-fineprint">Files stay in your browser — nothing is uploaded.</p>
     </div>
 
@@ -924,6 +933,9 @@ function createPanel(label, isSecondary) {
   // Wire the empty-state's "Choose a file" button to the topbar's hidden input.
   const emptyOpen = panel.root.querySelector('.js-empty-open');
   if (emptyOpen) emptyOpen.onclick = () => document.getElementById('file-input').click();
+  // Wire the "Try a sample" button — fetches the sibling sample bundled with the site.
+  const emptySample = panel.root.querySelector('.js-empty-sample');
+  if (emptySample) emptySample.onclick = () => loadFromUrl('./sample-report.json', panel);
   panels.push(panel);
   syncSelectFromSession(panel.select);
   return panel;
